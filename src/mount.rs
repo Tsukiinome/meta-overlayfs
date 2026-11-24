@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use procfs::process::Process;
@@ -214,9 +213,23 @@ fn mount_partition(partition_name: &str, lowerdir: &Vec<String>) -> Result<()> {
     mount_overlay(&partition, lowerdir, workdir, upperdir)
 }
 
-/// Collect enabled module IDs from metadata directory
+/// Partitions mounted besides `system`, in a fixed order (the old code iterated a
+/// `HashMap`, so the order changed from boot to boot).
+pub const EXTRA_PARTITIONS: [&str; 5] = ["vendor", "product", "system_ext", "odm", "oem"];
+
+/// What is going to be mounted: for every partition, the module directories used
+/// as overlay lower layers. The FIRST entry has the HIGHEST priority.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MountPlan {
+    pub system: Vec<String>,
+    pub others: Vec<(&'static str, Vec<String>)>,
+}
+
+/// Collect enabled module IDs from metadata directory.
 ///
-/// Reads module list and status from metadata directory, returns enabled module IDs
+/// Reads module list and status from metadata directory and returns the enabled
+/// module IDs sorted alphabetically, so that conflicts between two modules
+/// that ship the same file are always resolved the same way.
 fn collect_enabled_modules(metadata_dir: &str) -> Result<Vec<String>> {
     let dir = std::fs::read_dir(metadata_dir)
         .with_context(|| format!("Failed to read metadata directory: {}", metadata_dir))?;
@@ -234,6 +247,11 @@ fn collect_enabled_modules(metadata_dir: &str) -> Result<Vec<String>> {
             None => continue,
         };
 
+        // Hidden directories (".rw", ...) are not modules.
+        if module_id.starts_with('.') {
+            continue;
+        }
+
         // Check status markers
         if path.join(DISABLE_FILE_NAME).exists() {
             info!("Module {} is disabled, skipping", module_id);
@@ -245,8 +263,7 @@ fn collect_enabled_modules(metadata_dir: &str) -> Result<Vec<String>> {
             continue;
         }
 
-        // Optional: verify module.prop exists
-        if !path.join("module.prop").exists() && !path.eq(Path::new(SYSTEM_RW_DIR)) {
+        if !path.join("module.prop").exists() {
             warn!("Module {} has no module.prop, skipping", module_id);
             continue;
         }
@@ -255,39 +272,26 @@ fn collect_enabled_modules(metadata_dir: &str) -> Result<Vec<String>> {
         enabled.push(module_id);
     }
 
+    enabled.sort();
     Ok(enabled)
 }
 
-/// Dual-directory version of mount_modules_systemlessly
+/// Build the mount plan without touching any mount (also used by `plan`).
 ///
 /// Parameters:
 /// - metadata_dir: Metadata directory, stores module.prop, disable, skip_mount, etc.
 /// - content_dir: Content directory, stores system/, vendor/ and other partition content (ext4 image mount point)
-pub fn mount_modules_systemlessly(metadata_dir: &str, content_dir: &str) -> Result<()> {
-    info!("Scanning modules (dual-directory mode)");
-    info!("  Metadata: {}", metadata_dir);
-    info!("  Content: {}", content_dir);
-
-    // 1. Traverse metadata directory, collect enabled module IDs
+pub fn build_plan(metadata_dir: &str, content_dir: &str) -> Result<MountPlan> {
     let enabled_modules = collect_enabled_modules(metadata_dir)?;
 
-    if enabled_modules.is_empty() {
-        info!("No enabled modules found");
-        return Ok(());
-    }
+    let mut plan = MountPlan {
+        system: Vec::new(),
+        others: EXTRA_PARTITIONS
+            .iter()
+            .map(|p| (*p, Vec::new()))
+            .collect(),
+    };
 
-    info!("Found {} enabled module(s)", enabled_modules.len());
-
-    // 2. Initialize partition lowerdir lists
-    let partition = vec!["vendor", "product", "system_ext", "odm", "oem"];
-    let mut system_lowerdir: Vec<String> = Vec::new();
-    let mut partition_lowerdir: HashMap<String, Vec<String>> = HashMap::new();
-
-    for part in &partition {
-        partition_lowerdir.insert((*part).to_string(), Vec::new());
-    }
-
-    // 3. Read module content from content directory
     for module_id in &enabled_modules {
         let module_content_path = Path::new(content_dir).join(module_id);
 
@@ -298,38 +302,159 @@ pub fn mount_modules_systemlessly(metadata_dir: &str, content_dir: &str) -> Resu
 
         info!("Processing module: {}", module_id);
 
-        // Collect system partition
         let system_path = module_content_path.join("system");
         if system_path.is_dir() {
-            system_lowerdir.push(system_path.display().to_string());
+            plan.system.push(system_path.display().to_string());
             info!("  + system/");
         }
 
-        // Collect other partitions
-        for part in &partition {
-            let part_path = module_content_path.join(part);
-            if part_path.is_dir()
-                && let Some(v) = partition_lowerdir.get_mut(*part)
-            {
-                v.push(part_path.display().to_string());
+        for (part, dirs) in plan.others.iter_mut() {
+            let part_path = module_content_path.join(*part);
+            if part_path.is_dir() {
+                dirs.push(part_path.display().to_string());
                 info!("  + {}/", part);
             }
         }
     }
 
-    // 4. Mount partitions
+    Ok(plan)
+}
+
+/// Dual-directory version of mount_modules_systemlessly
+pub fn mount_modules_systemlessly(metadata_dir: &str, content_dir: &str) -> Result<()> {
+    info!("Scanning modules (dual-directory mode)");
+    info!("  Metadata: {}", metadata_dir);
+    info!("  Content: {}", content_dir);
+
+    let plan = build_plan(metadata_dir, content_dir)?;
+
     info!("Mounting partitions...");
 
-    if let Err(e) = mount_partition("system", &system_lowerdir) {
+    if let Err(e) = mount_partition("system", &plan.system) {
         warn!("mount system failed: {e:#}");
     }
 
-    for (k, v) in partition_lowerdir {
-        if let Err(e) = mount_partition(&k, &v) {
-            warn!("mount {k} failed: {e:#}");
+    for (name, dirs) in &plan.others {
+        if let Err(e) = mount_partition(name, dirs) {
+            warn!("mount {name} failed: {e:#}");
         }
     }
 
     info!("All partitions processed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "meta-overlayfs-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn module(meta: &Path, content: &Path, id: &str, parts: &[&str], markers: &[&str]) {
+        fs::create_dir_all(meta.join(id)).unwrap();
+        fs::write(meta.join(id).join("module.prop"), format!("id={id}\n")).unwrap();
+        for m in markers {
+            fs::write(meta.join(id).join(m), "").unwrap();
+        }
+        fs::create_dir_all(content.join(id)).unwrap();
+        for p in parts {
+            fs::create_dir_all(content.join(id).join(p)).unwrap();
+        }
+    }
+
+    #[test]
+    fn modules_are_sorted_and_filtered() {
+        let root = scratch();
+        let (meta, content) = (root.join("meta"), root.join("content"));
+        module(&meta, &content, "zeta", &["system"], &[]);
+        module(&meta, &content, "alpha", &["system"], &[]);
+        module(&meta, &content, "off", &["system"], &["disable"]);
+        module(&meta, &content, "skipped", &["system"], &["skip_mount"]);
+        fs::create_dir_all(meta.join(".rw/system/upperdir")).unwrap();
+        fs::create_dir_all(meta.join("noprop")).unwrap();
+        fs::write(meta.join("a-file"), "").unwrap();
+
+        let ids = collect_enabled_modules(meta.to_str().unwrap()).unwrap();
+        assert_eq!(ids, vec!["alpha".to_string(), "zeta".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_covers_modules_without_system_dir() {
+        // A module that only ships product/ must still be planned.
+        let root = scratch();
+        let (meta, content) = (root.join("meta"), root.join("content"));
+        module(&meta, &content, "only-product", &["product"], &[]);
+        module(&meta, &content, "both", &["system", "vendor", "product"], &[]);
+
+        let plan = build_plan(meta.to_str().unwrap(), content.to_str().unwrap()).unwrap();
+        let c = content.display();
+        assert_eq!(plan.system, vec![format!("{c}/both/system")]);
+
+        let get = |name: &str| {
+            plan.others
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            get("product"),
+            vec![format!("{c}/both/product"), format!("{c}/only-product/product")]
+        );
+        assert_eq!(get("vendor"), vec![format!("{c}/both/vendor")]);
+        assert!(get("odm").is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_order_is_stable_and_partitions_fixed() {
+        let root = scratch();
+        let (meta, content) = (root.join("meta"), root.join("content"));
+        for id in ["m3", "m1", "m2"] {
+            module(&meta, &content, id, &["system"], &[]);
+        }
+        let names: Vec<_> = (0..5)
+            .map(|_| build_plan(meta.to_str().unwrap(), content.to_str().unwrap()).unwrap())
+            .collect();
+        assert!(names.windows(2).all(|w| w[0] == w[1]));
+        let order: Vec<&str> = names[0].others.iter().map(|(n, _)| *n).collect();
+        assert_eq!(order, EXTRA_PARTITIONS.to_vec());
+        let c = content.display();
+        assert_eq!(
+            names[0].system,
+            vec![
+                format!("{c}/m1/system"),
+                format!("{c}/m2/system"),
+                format!("{c}/m3/system")
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn module_without_content_is_skipped() {
+        let root = scratch();
+        let (meta, content) = (root.join("meta"), root.join("content"));
+        fs::create_dir_all(&content).unwrap();
+        fs::create_dir_all(meta.join("ghost")).unwrap();
+        fs::write(meta.join("ghost/module.prop"), "id=ghost\n").unwrap();
+        let plan = build_plan(meta.to_str().unwrap(), content.to_str().unwrap()).unwrap();
+        assert!(plan.system.is_empty());
+        assert!(plan.others.iter().all(|(_, v)| v.is_empty()));
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -58,6 +58,26 @@ else
     cargo ndk build -t x86_64 --release
 fi
 
+# Optional 32-bit targets (EXTRA_ARCHS=1 ./build.sh). Needs the matching rustup targets:
+#   rustup target add armv7-linux-android i686-linux-android
+EXTRA_ARCHS="${EXTRA_ARCHS:-0}"
+if [ "$EXTRA_ARCHS" = "1" ]; then
+    echo ""
+    echo "Building for armv7-linux-androideabi..."
+    if [ "$BUILD_TOOL" = "cross" ]; then
+        cross build --release --target armv7-linux-androideabi
+    else
+        cargo ndk build -t armeabi-v7a --release
+    fi
+    echo ""
+    echo "Building for i686-linux-android..."
+    if [ "$BUILD_TOOL" = "cross" ]; then
+        cross build --release --target i686-linux-android
+    else
+        cargo ndk build -t x86 --release
+    fi
+fi
+
 # Copy binaries
 echo ""
 echo "Copying binaries..."
@@ -65,6 +85,13 @@ cp target/aarch64-linux-android/release/meta-overlayfs \
    "$MODULE_OUTPUT_DIR/meta-overlayfs-aarch64"
 cp target/x86_64-linux-android/release/meta-overlayfs \
    "$MODULE_OUTPUT_DIR/meta-overlayfs-x86_64"
+
+if [ "$EXTRA_ARCHS" = "1" ]; then
+    cp target/armv7-linux-androideabi/release/meta-overlayfs \
+       "$MODULE_OUTPUT_DIR/meta-overlayfs-armv7"
+    cp target/i686-linux-android/release/meta-overlayfs \
+       "$MODULE_OUTPUT_DIR/meta-overlayfs-x86"
+fi
 
 # Copy metamodule files
 echo "Copying metamodule files..."

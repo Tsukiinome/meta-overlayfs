@@ -1,89 +1,83 @@
 #!/system/bin/sh
 # meta-overlayfs Module Mount Handler
-# This script is the entry point for dual-directory module mounting
+# Entry point called by KernelSU after all post-fs-data scripts.
 
 MODDIR="${0%/*}"
-IMG_FILE="$MODDIR/modules.img"
-MNT_DIR="$MODDIR/mnt"
+META_MODDIR="$MODDIR"
+. "$MODDIR/common.sh"
+
 RW_ROOT="/data/adb/modules/.rw"
-PARTITIONS="system vendor product system_ext odm oem"
+VERSION=$(grep -m1 '^version=' "$MODDIR/module.prop" 2>/dev/null | cut -d= -f2-)
 
-# Log function
-log() {
-    echo "[meta-overlayfs] $1"
-}
+mo_rotate_log
+mo_log "=== boot mount start (v${VERSION:-?}) ==="
 
-log "Starting module mount process"
-
-# Ensure ext4 image is mounted
-if ! mountpoint -q "$MNT_DIR" 2>/dev/null; then
-    log "Image not mounted, mounting now..."
-
-    # Check if image file exists
-    if [ ! -f "$IMG_FILE" ]; then
-        log "ERROR: Image file not found at $IMG_FILE"
-        exit 1
-    fi
-
-    # Create mount point
-    mkdir -p "$MNT_DIR"
-
-    # Mount the ext4 image
-    chcon u:object_r:ksu_file:s0 "$IMG_FILE" 2>/dev/null
-    mount -t ext4 -o loop,rw,noatime "$IMG_FILE" "$MNT_DIR" || {
-        log "ERROR: Failed to mount image"
-        exit 1
-    }
-    log "Image mounted successfully at $MNT_DIR"
-else
-    log "Image already mounted at $MNT_DIR"
+# --- Anti-bootloop guard ----------------------------------------------------
+if mo_safe_check; then
+    mo_set_status "SAFE MODE - mounts disabled, open Action to re-enable"
+    exit 0
 fi
 
-# Binary path (architecture-specific binary selected during installation)
+# --- Mount the ext4 image ---------------------------------------------------
 BINARY="$MODDIR/meta-overlayfs"
-
 if [ ! -f "$BINARY" ]; then
-    log "ERROR: Binary not found: $BINARY"
+    mo_log "ERROR: binary not found: $BINARY"
+    mo_set_status "ERROR - binary missing, reinstall"
     exit 1
 fi
 
-# Special .rw handling
-if [ -d "$RW_ROOT" ]; then
-    log "Applying SELinux contexts for RW partition structures"
+if ! mountpoint -q "$MNT_DIR" 2>/dev/null; then
+    if [ ! -f "$IMG_FILE" ]; then
+        mo_log "ERROR: image file not found at $IMG_FILE"
+        mo_set_status "ERROR - modules.img missing"
+        exit 1
+    fi
+    mo_log "Image not mounted, checking and mounting it"
+    mo_fsck "$IMG_FILE"
+    if ! mo_mount_image; then
+        mo_log "ERROR: failed to mount $IMG_FILE"
+        mo_set_status "ERROR - could not mount modules.img"
+        exit 1
+    fi
+    mo_log "Image mounted at $MNT_DIR"
+else
+    mo_log "Image already mounted at $MNT_DIR"
+fi
 
+# --- SELinux contexts for the optional read-write layer ---------------------
+if [ -d "$RW_ROOT" ]; then
+    mo_log "Applying SELinux contexts for RW partition structures"
     for part in $PARTITIONS; do
         PART_DIR="$RW_ROOT/$part"
         REFERENCE_PATH="/$part"
         if [ -d "$PART_DIR" ] && [ -e "$REFERENCE_PATH" ]; then
             chcon --reference="$REFERENCE_PATH" "$PART_DIR" 2>/dev/null
-            UPPER_DIR="$PART_DIR/upperdir"
-            if [ -d "$UPPER_DIR" ]; then
-                chcon --reference="$PART_DIR" "$UPPER_DIR" 2>/dev/null
-            fi
-            WORK_DIR="$PART_DIR/workdir"
-            if [ -d "$WORK_DIR" ]; then
-                chcon --reference="$PART_DIR" "$WORK_DIR" 2>/dev/null
-            fi
+            [ -d "$PART_DIR/upperdir" ] && chcon --reference="$PART_DIR" "$PART_DIR/upperdir" 2>/dev/null
+            [ -d "$PART_DIR/workdir" ] && chcon --reference="$PART_DIR" "$PART_DIR/workdir" 2>/dev/null
         fi
     done
 fi
 
-# Set dual-directory environment variables
+# --- Run the mount binary ---------------------------------------------------
 export MODULE_METADATA_DIR="/data/adb/modules"
 export MODULE_CONTENT_DIR="$MNT_DIR"
+export RUST_LOG="${RUST_LOG:-info}"
 
-log "Metadata directory: $MODULE_METADATA_DIR"
-log "Content directory: $MODULE_CONTENT_DIR"
-log "Executing $BINARY"
+mo_log "Metadata directory: $MODULE_METADATA_DIR"
+mo_log "Content directory: $MODULE_CONTENT_DIR"
+mo_log "Executing $BINARY"
 
-# Execute the mount binary
-"$BINARY"
+# The binary logs to stderr: keep everything in the persistent log.
+"$BINARY" >>"$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
-if [ $EXIT_CODE -ne 0 ]; then
-    log "Mount failed with exit code $EXIT_CODE"
-    exit $EXIT_CODE
+if [ "$EXIT_CODE" -ne 0 ]; then
+    mo_log "Mount failed with exit code $EXIT_CODE"
+    mo_set_status "ERROR - mount failed (code $EXIT_CODE), see log"
+    exit "$EXIT_CODE"
 fi
 
-log "Mount completed successfully"
+N=$(grep -c ' overlay ' /proc/mounts 2>/dev/null)
+mo_log "Mount completed successfully"
+mo_set_status "OK - overlays active: ${N:-0}"
 exit 0

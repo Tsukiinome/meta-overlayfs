@@ -5,6 +5,7 @@ on:
     branches: [ "main", "dev", "ci" ]
     paths:
       - 'src/**'
+      - 'metamodule/**'
       - 'Cargo.toml'
       - 'build.sh'
     tags:

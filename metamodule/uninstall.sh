@@ -1,11 +1,12 @@
 #!/system/bin/sh
 ############################################
-# mm-overlayfs uninstall.sh
+# meta-overlayfs uninstall.sh
 # Cleanup script for metamodule removal
 ############################################
 
 MODDIR="${0%/*}"
 MNT_DIR="$MODDIR/mnt"
+STATE_DIR="${META_STATE_DIR:-/data/adb/meta-overlayfs}"
 
 echo "- Uninstalling metamodule..."
 
@@ -18,6 +19,9 @@ if mountpoint -q "$MNT_DIR" 2>/dev/null; then
     }
     echo "- Image unmounted"
 fi
+
+# Persistent state (logs, anti-bootloop counters)
+rm -rf "$STATE_DIR"
 
 echo "- Uninstall complete"
 
