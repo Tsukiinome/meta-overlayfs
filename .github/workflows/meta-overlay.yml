@@ -1,11 +1,13 @@
 name: Build and Release
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main", "dev", "ci" ]
     paths:
       - 'src/**'
       - 'metamodule/**'
+      - '.github/workflows/**'
       - 'Cargo.toml'
       - 'build.sh'
     tags:
